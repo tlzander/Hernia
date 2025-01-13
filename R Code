@@ -1,0 +1,820 @@
+# Load libraries
+library(xgboost)
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+# Set global seed
+set.seed(123)
+
+# Load data
+data <- fread("Y:/Tyler Zander/NSQIP Hernia/HerniaV6.csv")
+
+# Save 'CaseID' for later use
+case_id <- data$CaseID
+data[, CaseID := NULL]
+
+# Rename variables for later SHAP dependence plots
+setnames(data, 
+         old = c("DOptoDis", "MORBPROB", "OPTIME", "MORTPROB", "PRBUN", "INOUT", 
+                 "WORKRVU", "PRHCT", "WEIGHT", "PRWBC", "PRSODM", "PRPLATE",
+                 "PRCREAT", "PRALKPH", "PRINR", "HEIGHT", "PRSGOT", "PRBILI",
+                 "Initialincar"),
+         new = c("Days OR to DC", "Morbidity probability", "Operation time", 
+                 "Mortality probability", "Preoperative BUN", "Admission status",
+                 "Work RVU", "Preoperative hematocrit", "Weight", "Preoperative WBC",
+                 "Preoperative sodium", "Preoperative platelets", "Preoperative creatinine",
+                 "Preoperative alkaline phosphatase", "Preoperative INR", "Height",
+                 "Preoperative SGOT", "Preoperative bilirubin", "Initial Incarcerated Hernia"))
+
+# Define numerical features
+numerical_features <- c("Work RVU", "Age", "Height", "Weight", "Preoperative sodium",
+                        "Preoperative BUN", "Preoperative creatinine", "Preoperative albumin",
+                        "Preoperative bilirubin", "Preoperative SGOT", "Preoperative alkaline phosphatase",
+                        "Preoperative WBC", "Preoperative hematocrit", "Preoperative platelets",
+                        "Preoperative PTT", "Preoperative INR", "Mortality probability",
+                        "Morbidity probability", "Operation time", "HtoODay", "Days OR to DC", "ASACLAS")
+# Define categorical features
+categorical_features <- setdiff(names(data), c(numerical_features, "UNPLANNEDREADMISSION1"))
+
+# Convert categorical features to factors and then to integer
+data[, (categorical_features) := lapply(.SD, function(x) as.integer(as.factor(x))), .SDcols = categorical_features]
+
+# Convert the target variable to binary
+data$UNPLANNEDREADMISSION1 <- as.numeric(as.factor(data$UNPLANNEDREADMISSION1)) - 1
+
+# Set seed
+set.seed(123)
+folds <- createFolds(data$UNPLANNEDREADMISSION1, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Lists to store results
+all_predictions <- list()
+all_actual <- list()
+all_test_data <- list()
+all_shap_values <- list()
+all_val_predictions <- list()
+all_val_actual <- list()
+all_val_data <- list()
+
+# Metrics calculations
+calculate_metrics <- function(actual, predicted, threshold) {
+  pred_classes <- ifelse(predicted > threshold, 1, 0)
+  confusion_matrix <- table(Actual = factor(actual, levels = c(0, 1)), 
+                            Predicted = factor(pred_classes, levels = c(0, 1)))
+  
+  if (nrow(confusion_matrix) < 2 || ncol(confusion_matrix) < 2) {
+    return(c(Accuracy = NA, Specificity = NA, Recall = NA, 
+             Precision = NA, F1_Score = NA, AUC = NA, 
+             Brier_Score = mean((predicted - actual)^2)))
+  }
+  
+  tp <- confusion_matrix[2,2]
+  fp <- confusion_matrix[1,2]
+  tn <- confusion_matrix[1,1]
+  fn <- confusion_matrix[2,1]
+  
+  accuracy <- (tp + tn) / sum(confusion_matrix)
+  specificity <- tn / (tn + fp)
+  recall <- tp / (tp + fn)
+  precision <- tp / (tp + fp)
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  auc <- tryCatch({
+    auc(actual, predicted)
+  }, error = function(e) NA)
+  brier_score <- mean((predicted - actual)^2)
+  
+  return(c(Accuracy = accuracy, Specificity = specificity, Recall = recall, 
+           Precision = precision, F1_Score = f1_score, AUC = auc, 
+           Brier_Score = brier_score))
+}
+
+# Find optimal F1 threshold
+find_optimal_threshold <- function(actual, predicted) {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  f1_scores <- sapply(thresholds, function(thresh) {
+    pred_classes <- ifelse(predicted > thresh, 1, 0)
+    confusion_matrix <- table(Actual = actual, Predicted = pred_classes)
+    precision <- confusion_matrix[2,2] / sum(confusion_matrix[,2])
+    recall <- confusion_matrix[2,2] / sum(confusion_matrix[2,])
+    f1_score <- 2 * (precision * recall) / (precision + recall)
+    return(f1_score)
+  })
+  return(thresholds[which.max(f1_scores)])
+}
+
+# Perform 5-fold cross-validation with train/validate/test
+for (i in 1:5) {
+  # Set fold-specific seed
+  set.seed(123 + i)
+  
+  # Split data into training+validation and test sets
+  train_val_indices <- unlist(folds[-i])
+  test_indices <- folds[[i]]
+  
+  train_val_data <- data[train_val_indices,]
+  test_data <- data[test_indices,]
+  
+  # Further split into training and validation
+  train_indices <- sample(1:nrow(train_val_data), size = 0.75 * nrow(train_val_data))
+  val_indices <- setdiff(1:nrow(train_val_data), train_indices)
+  
+  train_data <- train_val_data[train_indices,]
+  val_data <- train_val_data[val_indices,]
+  
+  # Calculate scale_pos_weight
+  positive_cases <- sum(train_data$UNPLANNEDREADMISSION1 == 1)
+  negative_cases <- sum(train_data$UNPLANNEDREADMISSION1 == 0)
+  scale_pos_weight_val <- negative_cases / positive_cases
+  
+  # Prepare for XGBoost
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, .SD, .SDcols = !c("UNPLANNEDREADMISSION1")]), 
+                        label = train_data$UNPLANNEDREADMISSION1)
+  dval <- xgb.DMatrix(data = as.matrix(val_data[, .SD, .SDcols = !c("UNPLANNEDREADMISSION1")]), 
+                      label = val_data$UNPLANNEDREADMISSION1)
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, .SD, .SDcols = !c("UNPLANNEDREADMISSION1")]), 
+                       label = test_data$UNPLANNEDREADMISSION1)
+  
+  # Set parameters
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = c("logloss", "auc"),
+    eta = 0.01,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 20,
+    alpha = 0.1,
+    lambda = 0.1,
+    scale_pos_weight = scale_pos_weight_val,
+    seed = 123 + i  
+  )
+  
+  # Train the model
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    watchlist = list(train = dtrain, val = dval),
+    early_stopping_rounds = 50,
+    print_every_n = 100
+  )
+  
+  # Make predictions
+  val_predictions <- predict(model, dval)
+  test_predictions <- predict(model, dtest)
+  
+  # Store results
+  all_predictions[[i]] <- test_predictions
+  all_actual[[i]] <- test_data$UNPLANNEDREADMISSION1
+  all_test_data[[i]] <- test_data
+  all_val_predictions[[i]] <- val_predictions
+  all_val_actual[[i]] <- val_data$UNPLANNEDREADMISSION1
+  all_val_data[[i]] <- val_data
+  
+  # Calculate SHAP values
+  shap_values <- predict(model, as.matrix(test_data[, .SD, .SDcols = !c("UNPLANNEDREADMISSION1")]), predcontrib = TRUE)
+  all_shap_values[[i]] <- shap_values
+}
+
+# Combine results from all folds
+combined_predictions <- unlist(all_predictions)
+combined_actual <- unlist(all_actual)
+combined_test_data <- rbindlist(all_test_data)
+combined_val_predictions <- unlist(all_val_predictions)
+combined_val_actual <- unlist(all_val_actual)
+combined_val_data <- rbindlist(all_val_data)
+
+# Find optimal thresholds for both sets
+val_threshold <- find_optimal_threshold(combined_val_actual, combined_val_predictions)
+test_threshold <- find_optimal_threshold(combined_actual, combined_predictions)
+
+print(paste("Validation set F1-maximizing threshold:", val_threshold))
+print(paste("Test set F1-maximizing threshold:", test_threshold))
+
+# Calculate metrics using respective optimal thresholds
+val_metrics <- calculate_metrics(combined_val_actual, combined_val_predictions, val_threshold)
+test_metrics <- calculate_metrics(combined_actual, combined_predictions, test_threshold)
+
+# Print results
+print("\nValidation Set Metrics (using validation threshold):")
+print(val_metrics)
+print("\nTest Set Metrics (using test threshold):")
+print(test_metrics)
+
+# Create metrics comparison
+metrics_comparison <- rbind(
+  Validation = val_metrics,
+  Test = test_metrics
+)
+print("\nMetrics Comparison (using separate thresholds):")
+print(metrics_comparison)
+
+# Calculate cross-threshold performance
+val_metrics_test_threshold <- calculate_metrics(combined_val_actual, combined_val_predictions, test_threshold)
+test_metrics_val_threshold <- calculate_metrics(combined_actual, combined_predictions, val_threshold)
+
+print("\nCross-threshold comparison:")
+print("Validation set metrics using test threshold:")
+print(val_metrics_test_threshold)
+print("\nTest set metrics using validation threshold:")
+print(test_metrics_val_threshold)
+
+################################################################################
+# ANALYSIS OF SUBGROUPS
+
+# Function to perform subgroup analysis
+perform_subgroup_analysis <- function(data, predictions, variable) {
+  subgroups <- unique(data[[variable]])
+  results <- lapply(subgroups, function(subgroup) {
+    subgroup_data <- data[data[[variable]] == subgroup, ]
+    subgroup_predictions <- predictions[data[[variable]] == subgroup]
+    subgroup_actual <- subgroup_data$UNPLANNEDREADMISSION1
+    metrics <- calculate_metrics(subgroup_actual, subgroup_predictions, test_threshold)
+    return(c(Subgroup = as.character(subgroup), metrics))
+  })
+  return(do.call(rbind, results))
+}
+
+# Function to perform subgroup analysis
+perform_subgroup_analysis_safe <- function(data, predictions, variable) {
+  tryCatch({
+    analysis <- perform_subgroup_analysis(data, predictions, variable)
+    return(list(success = TRUE, result = analysis))
+  }, error = function(e) {
+    message(paste("Error in analysis for", variable, ":", e$message))
+    return(list(success = FALSE, result = NULL))
+  })
+}
+
+# Perform subgroup analysis
+sex_analysis <- perform_subgroup_analysis_safe(combined_test_data, combined_predictions, "SEX")
+ethnicity_analysis <- perform_subgroup_analysis_safe(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC")
+race_analysis <- perform_subgroup_analysis_safe(combined_test_data, combined_predictions, "race_new")
+
+# Combine into one data frame
+all_analyses <- do.call(rbind, lapply(list(
+  list(Variable = "SEX", analysis = sex_analysis),
+  list(Variable = "ETHNICITY_HISPANIC", analysis = ethnicity_analysis),
+  list(Variable = "race_new", analysis = race_analysis)
+), function(x) {
+  if (x$analysis$success) {
+    cbind(Variable = x$Variable, x$analysis$result)
+  } else {
+    data.frame(Variable = x$Variable, Subgroup = NA, Accuracy = NA, Specificity = NA, 
+               Recall = NA, Precision = NA, F1_Score = NA, AUC = NA, Brier_Score = NA)
+  }
+}))
+
+# Convert to data frame
+results_df <- as.data.frame(all_analyses, stringsAsFactors = FALSE)
+numeric_cols <- sapply(results_df, is.numeric)
+results_df[numeric_cols] <- lapply(results_df[numeric_cols], function(x) round(as.numeric(x), digits = 3))
+
+# Print results
+print(results_df)
+
+# Write results to CSV
+write.csv(results_df, "subgroup_analysis_results_cv.csv", row.names = FALSE)
+
+################################################################################
+# FAIRNESS METRICS
+
+# Calculate fairness metrics
+calculate_fairness_metrics <- function(data, predictions, variable, unprivileged_value, privileged_value) {
+  data$predictions <- predictions
+  
+  # Filter data to include only specified values
+  valid_data <- data %>%
+    filter(!!sym(variable) %in% c(unprivileged_value, privileged_value))
+  
+  # Statistical Parity Difference
+  spd <- valid_data %>%
+    group_by(!!sym(variable)) %>%
+    summarize(selection_rate = mean(predictions > test_threshold), .groups = "drop") %>%
+    summarize(spd = selection_rate[!!sym(variable) == privileged_value] - 
+                selection_rate[!!sym(variable) == unprivileged_value]) %>%
+    pull(spd)
+  
+  # Equal Opportunity Difference
+  eod <- valid_data %>%
+    filter(UNPLANNEDREADMISSION1 == 1) %>%
+    group_by(!!sym(variable)) %>%
+    summarize(tpr = mean(predictions > test_threshold), .groups = "drop") %>%
+    summarize(eod = tpr[!!sym(variable) == privileged_value] - 
+                tpr[!!sym(variable) == unprivileged_value]) %>%
+    pull(eod)
+  
+  # Average Odds Difference
+  aod <- valid_data %>%
+    group_by(!!sym(variable)) %>%
+    summarize(
+      fpr = mean(predictions[UNPLANNEDREADMISSION1 == 0] > test_threshold),
+      tpr = mean(predictions[UNPLANNEDREADMISSION1 == 1] > test_threshold),
+      avg_odds = (tpr + (1 - fpr)) / 2,
+      .groups = "drop"
+    ) %>%
+    summarize(aod = avg_odds[!!sym(variable) == privileged_value] - 
+                avg_odds[!!sym(variable) == unprivileged_value]) %>%
+    pull(aod)
+  
+  # Disparate Impact
+  di <- valid_data %>%
+    group_by(!!sym(variable)) %>%
+    summarize(selection_rate = mean(predictions > test_threshold), .groups = "drop") %>%
+    summarize(di = selection_rate[!!sym(variable) == unprivileged_value] / 
+                selection_rate[!!sym(variable) == privileged_value]) %>%
+    pull(di)
+  
+  return(c(
+    "Statistical Parity Difference" = spd,
+    "Equal Opportunity Difference" = eod,
+    "Average Odds Difference" = aod,
+    "Disparate Impact" = di
+  ))
+}
+
+# Calculate fairness metrics
+fairness_sex <- calculate_fairness_metrics(combined_test_data, combined_predictions, "SEX", "1", "2")
+fairness_ethnicity <- calculate_fairness_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "3", "2")
+fairness_race <- calculate_fairness_metrics(combined_test_data, combined_predictions, "race_new", "2", "3")
+
+# Combine fairness metrics
+fairness_df <- data.frame(
+  Variable = c("SEX", "ETHNICITY_HISPANIC", "race_new"),
+  rbind(fairness_sex, fairness_ethnicity, fairness_race)
+)
+
+# Round numeric columns
+numeric_cols <- sapply(fairness_df, is.numeric)
+fairness_df[numeric_cols] <- lapply(fairness_df[numeric_cols], round, digits = 3)
+
+# Print fairness metrics
+print(fairness_df)
+
+################################################################################
+
+# SHAP Analysis
+
+# Combine SHAP values from all folds
+combined_shap_values <- do.call(rbind, all_shap_values)
+
+# Calculate mean absolute SHAP values
+mean_abs_shap <- colMeans(abs(combined_shap_values[, 1:(ncol(combined_shap_values)-1)]))
+
+# Create a data frame of mean absolute SHAP values
+shap_importance <- data.frame(
+  Feature = setdiff(names(data), "UNPLANNEDREADMISSION1"),
+  MeanAbsSHAP = mean_abs_shap
+)
+
+# Sort the data frame
+shap_importance <- shap_importance[order(-shap_importance$MeanAbsSHAP), ]
+
+# Print the top 20 features
+print("Top 20 features by SHAP importance:")
+print(head(shap_importance, 20))
+
+# Write SHAP importance to CSV
+write.csv(shap_importance, "shap_importance_cv.csv", row.names = FALSE)
+
+# Save the results (modified to include test threshold)
+saveRDS(list(predictions = combined_predictions, 
+             actual = combined_actual, 
+             test_data = combined_test_data,
+             shap_values = combined_shap_values,
+             test_metrics = test_metrics,
+             subgroup_analysis = results_df,
+             fairness_metrics = fairness_df,
+             shap_importance = shap_importance,
+             test_threshold = test_threshold), 
+        "cv_results.rds")
+
+print("Analysis complete. Results saved in 'cv_results.rds'.")
+
+# Frequency tables for demographics
+sex_freq <- table(combined_test_data$SEX)
+print("Sex frequency in test set:")
+print(sex_freq)
+
+race_freq <- table(combined_test_data$race_new)
+print("\nRace frequency in test set:")
+print(race_freq)
+
+ethnicity_freq <- table(combined_test_data$ETHNICITY_HISPANIC)
+print("\nEthnicity frequency in test set:")
+print(ethnicity_freq)
+
+################################################################################
+# CONCENTRATION CURVE AND LIFT ANALYSIS
+
+calculate_concentration <- function(predictions, actual) {
+  df <- data.frame(pred = predictions, actual = actual)
+  df <- df[order(-df$pred),]
+  
+  df$cum_prop_population <- (1:nrow(df)) / nrow(df)
+  df$cum_prop_readmissions <- cumsum(df$actual) / sum(df$actual)
+  
+  conc_index <- 2 * (0.5 - sum(df$cum_prop_readmissions[-nrow(df)] * diff(df$cum_prop_population)))
+  
+  conc_plot <- ggplot(df, aes(x = cum_prop_population, y = cum_prop_readmissions)) +
+    geom_line() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+    labs(x = "Cumulative Proportion of Population",
+         y = "Cumulative Proportion of Readmissions",
+         title = "") +
+    theme_minimal()
+  
+  return(list(plot = conc_plot, index = conc_index))
+}
+
+# Calculate lift function
+calculate_lift <- function(predictions, actual) {
+  df <- data.frame(pred = predictions, actual = actual)
+  df <- df[order(-df$pred),]
+  
+  df$cum_readmissions <- cumsum(df$actual)
+  df$prop_population <- (1:nrow(df)) / nrow(df)
+  df$lift <- (df$cum_readmissions / (1:nrow(df))) / (sum(df$actual) / nrow(df))
+  
+  lift_plot <- ggplot(df, aes(x = prop_population, y = lift)) +
+    geom_line() +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+    labs(x = "Proportion of Population",
+         y = "Lift",
+         title = "") +
+    theme_minimal() +
+    coord_cartesian(ylim = c(0, 6))
+  
+  lift_at_10 <- df$lift[nrow(df) * 0.1]
+  lift_at_20 <- df$lift[nrow(df) * 0.2]
+  lift_at_30 <- df$lift[nrow(df) * 0.3]
+  
+  return(list(plot = lift_plot, 
+              lift_at_10 = lift_at_10, 
+              lift_at_20 = lift_at_20, 
+              lift_at_30 = lift_at_30))
+}
+
+# Concentration curve and index analysis
+conc_results <- calculate_concentration(combined_predictions, combined_test_data$UNPLANNEDREADMISSION1)
+
+print(paste("Test Set Concentration Index:", round(conc_results$index, 4)))
+print(conc_results$plot)
+
+# Lift Analysis
+lift_results <- calculate_lift(combined_predictions, combined_test_data$UNPLANNEDREADMISSION1)
+
+print("Test Set Lift Analysis Results:")
+print(paste("Lift at 10%:", round(lift_results$lift_at_10, 2)))
+print(paste("Lift at 20%:", round(lift_results$lift_at_20, 2)))
+print(paste("Lift at 30%:", round(lift_results$lift_at_30, 2)))
+print(lift_results$plot)
+
+################################################################################
+# SUBGROUP SHAP ANALYSIS
+
+# Function to calculate mean absolute SHAP values for a subgroup
+calculate_subgroup_shap <- function(data, shap_values, variable, value) {
+  subgroup_indices <- which(data[[variable]] == value)
+  subgroup_shap <- shap_values[subgroup_indices, 1:(ncol(shap_values)-1)]
+  
+  mean_abs_shap <- colMeans(abs(subgroup_shap))
+  
+  shap_importance <- data.frame(
+    Feature = setdiff(names(data), "UNPLANNEDREADMISSION1"),
+    MeanAbsSHAP = mean_abs_shap
+  )
+  shap_importance <- shap_importance[order(-shap_importance$MeanAbsSHAP), ]
+  
+  return(shap_importance)
+}
+
+# Calculate SHAP importance for each subgroup
+shap_male <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "SEX", "2")
+shap_female <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "SEX", "1")
+shap_hispanic <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "ETHNICITY_HISPANIC", "3")
+shap_non_hispanic <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "ETHNICITY_HISPANIC", "2")
+shap_white <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "race_new", "2")
+shap_non_white <- calculate_subgroup_shap(combined_test_data, combined_shap_values, "race_new", "3")
+
+# Function to print top features
+print_top_features <- function(shap_df, subgroup_name, top_n = 10) {
+  cat("\nTop", top_n, "features for", subgroup_name, ":\n")
+  print(head(shap_df, top_n))
+  cat("\n")
+}
+
+# Print top 10 features for each subgroup
+print_top_features(shap_male, "Male (SEX = 2)")
+print_top_features(shap_female, "Female (SEX = 1)")
+print_top_features(shap_hispanic, "Hispanic (ETHNICITY_HISPANIC = 3)")
+print_top_features(shap_non_hispanic, "Non-Hispanic (ETHNICITY_HISPANIC = 2)")
+print_top_features(shap_white, "White (race_new = 2)")
+print_top_features(shap_non_white, "Non-White (race_new = 3)")
+
+# Function to compare top features between subgroups
+compare_top_features <- function(shap_df1, shap_df2, group1_name, group2_name, top_n = 10) {
+  cat("\nComparison of top", top_n, "features between", group1_name, "and", group2_name, ":\n")
+  
+  top_features1 <- head(shap_df1$Feature, top_n)
+  top_features2 <- head(shap_df2$Feature, top_n)
+  
+  common_features <- intersect(top_features1, top_features2)
+  unique_features1 <- setdiff(top_features1, top_features2)
+  unique_features2 <- setdiff(top_features2, top_features1)
+  
+  cat("Common features:", paste(common_features, collapse = ", "), "\n")
+  cat("Unique to", group1_name, ":", paste(unique_features1, collapse = ", "), "\n")
+  cat("Unique to", group2_name, ":", paste(unique_features2, collapse = ", "), "\n\n")
+}
+
+# Compare top features between subgroups
+compare_top_features(shap_male, shap_female, "Male", "Female")
+compare_top_features(shap_hispanic, shap_non_hispanic, "Hispanic", "Non-Hispanic")
+compare_top_features(shap_white, shap_non_white, "White", "Non-White")
+
+# Function to add subgroup identifier to SHAP importance data frame
+add_subgroup_info <- function(shap_df, subgroup_name) {
+  shap_df$Subgroup <- subgroup_name
+  return(shap_df)
+}
+
+# Add subgroup information to each SHAP data frame
+shap_overall <- add_subgroup_info(shap_importance, "Overall")
+shap_male <- add_subgroup_info(shap_male, "Male")
+shap_female <- add_subgroup_info(shap_female, "Female")
+shap_hispanic <- add_subgroup_info(shap_hispanic, "Hispanic")
+shap_non_hispanic <- add_subgroup_info(shap_non_hispanic, "Non-Hispanic")
+shap_white <- add_subgroup_info(shap_white, "White")
+shap_non_white <- add_subgroup_info(shap_non_white, "Non-White")
+
+# Combine all data frames
+combined_shap_results <- rbind(
+  shap_overall,
+  shap_male,
+  shap_female,
+  shap_hispanic,
+  shap_non_hispanic,
+  shap_white,
+  shap_non_white
+)
+
+# Convert to wide format
+library(tidyr)
+wide_shap_results <- pivot_wider(
+  combined_shap_results,
+  names_from = Subgroup,
+  values_from = MeanAbsSHAP,
+  id_cols = Feature
+)
+
+# Function to create ordered pairs of variables and SHAP values
+create_ordered_pairs <- function(shap_df) {
+  shap_df %>%
+    arrange(-MeanAbsSHAP) %>%
+    mutate(Var_SHAP = paste(Feature, sprintf("%.4f", MeanAbsSHAP), sep = " | ")) %>%
+    pull(Var_SHAP)
+}
+
+# Get ordered variable-SHAP pairs for each subgroup
+overall_pairs <- create_ordered_pairs(shap_importance)
+male_pairs <- create_ordered_pairs(shap_male)
+female_pairs <- create_ordered_pairs(shap_female)
+hispanic_pairs <- create_ordered_pairs(shap_hispanic)
+non_hispanic_pairs <- create_ordered_pairs(shap_non_hispanic)
+white_pairs <- create_ordered_pairs(shap_white)
+non_white_pairs <- create_ordered_pairs(shap_non_white)
+
+# Combine into a single data frame
+final_ordered_vars_shap <- data.frame(
+  Overall = overall_pairs,
+  Male = male_pairs,
+  Female = female_pairs,
+  Hispanic = hispanic_pairs,
+  NonHispanic = non_hispanic_pairs,
+  White = white_pairs,
+  NonWhite = non_white_pairs
+)
+
+# Create dataframe with separate variable and SHAP columns for each subgroup
+final_results <- data.frame(
+  # Overall
+  Overall_Variable = shap_importance %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  Overall_SHAP = shap_importance %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # Male
+  Male_Variable = shap_male %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  Male_SHAP = shap_male %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # Female
+  Female_Variable = shap_female %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  Female_SHAP = shap_female %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # Hispanic
+  Hispanic_Variable = shap_hispanic %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  Hispanic_SHAP = shap_hispanic %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # Non-Hispanic
+  NonHispanic_Variable = shap_non_hispanic %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  NonHispanic_SHAP = shap_non_hispanic %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # White
+  White_Variable = shap_white %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  White_SHAP = shap_white %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP),
+  
+  # Non-White
+  NonWhite_Variable = shap_non_white %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(Feature),
+  NonWhite_SHAP = shap_non_white %>% 
+    arrange(-MeanAbsSHAP) %>% 
+    pull(MeanAbsSHAP)
+)
+
+# Subgroup Metrics Analysis
+# Function to calculate confusion matrix and selection rate
+calculate_subgroup_metrics <- function(data, predictions, variable, value) {
+  subgroup_data <- data[data[[variable]] == value, ]
+  subgroup_predictions <- predictions[data[[variable]] == value]
+  
+  confusion_matrix <- table(Actual = subgroup_data$UNPLANNEDREADMISSION1, 
+                            Predicted = ifelse(subgroup_predictions > test_threshold, 1, 0))
+  
+  selection_rate <- mean(subgroup_predictions > test_threshold)
+  
+  return(list(confusion_matrix = confusion_matrix, selection_rate = selection_rate))
+}
+
+# Calculate and print results for each subgroup
+female_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "SEX", "1")
+male_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "SEX", "2")
+
+# Function to calculate confusion matrix and selection rate
+calculate_subgroup_metrics <- function(data, predictions, variable, value) {
+  subgroup_data <- data[data[[variable]] == value, ]
+  subgroup_predictions <- predictions[data[[variable]] == value]
+  
+  # Confusion Matrix
+  confusion_matrix <- table(Actual = subgroup_data$UNPLANNEDREADMISSION1, 
+                            Predicted = ifelse(subgroup_predictions > test_threshold, 1, 0))
+  
+  # Selection Rate
+  selection_rate <- mean(subgroup_predictions > test_threshold)
+  
+  return(list(confusion_matrix = confusion_matrix, selection_rate = selection_rate))
+}
+
+# Results function
+print_subgroup_results <- function(results, subgroup_name) {
+  cat("\nResults for", subgroup_name, ":\n")
+  print(results$confusion_matrix)
+  cat("Selection Rate:", round(results$selection_rate, 4), "\n\n")
+}
+
+# Calculate results for each subgroup
+# Sex (1 = Female, 2 = Male)
+female_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "SEX", "1")
+male_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "SEX", "2")
+
+print_subgroup_results(female_results, "Female (SEX = 1)")
+print_subgroup_results(male_results, "Male (SEX = 2)")
+
+# Ethnicity (3 = Hispanic, 2 = Non-Hispanic)
+hispanic_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "3")
+non_hispanic_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "2")
+
+print_subgroup_results(hispanic_results, "Hispanic (ETHNICITY_HISPANIC = 3)")
+print_subgroup_results(non_hispanic_results, "Non-Hispanic (ETHNICITY_HISPANIC = 2)")
+
+# Race (2 = White, 3 = Non-white)
+white_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "race_new", "2")
+non_white_results <- calculate_subgroup_metrics(combined_test_data, combined_predictions, "race_new", "3")
+
+print_subgroup_results(white_results, "White (race_new = 2)")
+print_subgroup_results(non_white_results, "Non-White (race_new = 3)")
+
+# Calculate overall selection rate
+overall_selection_rate <- mean(combined_predictions > test_threshold)
+cat("Overall Selection Rate:", round(overall_selection_rate, 4), "\n")
+
+
+# Function to calculate actual outcome rate
+calculate_outcome_rate <- function(data, variable, value) {
+  subgroup_data <- data[data[[variable]] == value, ]
+  outcome_rate <- mean(subgroup_data$UNPLANNEDREADMISSION1)
+  return(outcome_rate)
+}
+
+# Calculate actual outcome rates for each subgroup
+cat("\nActual Outcome Rates:\n")
+
+# Sex
+female_outcome <- calculate_outcome_rate(combined_test_data, "SEX", "1")
+male_outcome <- calculate_outcome_rate(combined_test_data, "SEX", "2")
+cat("Female (SEX = 1) Outcome Rate:", round(female_outcome, 4), "\n")
+cat("Male (SEX = 2) Outcome Rate:", round(male_outcome, 4), "\n\n")
+
+# Ethnicity
+hispanic_outcome <- calculate_outcome_rate(combined_test_data, "ETHNICITY_HISPANIC", "3")
+non_hispanic_outcome <- calculate_outcome_rate(combined_test_data, "ETHNICITY_HISPANIC", "2")
+cat("Hispanic (ETHNICITY_HISPANIC = 3) Outcome Rate:", round(hispanic_outcome, 4), "\n")
+cat("Non-Hispanic (ETHNICITY_HISPANIC = 2) Outcome Rate:", round(non_hispanic_outcome, 4), "\n\n")
+
+# Race
+white_outcome <- calculate_outcome_rate(combined_test_data, "race_new", "2")
+non_white_outcome <- calculate_outcome_rate(combined_test_data, "race_new", "3")
+cat("White (race_new = 2) Outcome Rate:", round(white_outcome, 4), "\n")
+cat("Non-White (race_new = 3) Outcome Rate:", round(non_white_outcome, 4), "\n\n")
+
+# Overall outcome rate
+overall_outcome_rate <- mean(combined_test_data$UNPLANNEDREADMISSION1)
+cat("Overall Outcome Rate:", round(overall_outcome_rate, 4), "\n")
+
+################################################################################
+
+# SHAP DEPENDENCE PLOTS
+
+# Recode Admission status values in combined_test_data for plot axis
+combined_test_data$`Admission status` <- ifelse(combined_test_data$`Admission status` == 1, "Inpatient", "Outpatient")
+table(combined_test_data$`Admission status`)
+
+# Get the top 10 features from shap_importance dataframe
+top_10_features <- head(shap_importance$Feature, 10)
+
+# Start the PDF graphics device
+pdf("Shapley_plots_UnplannedReadmissionZV3.pdf")
+
+# Generate each plot for top 10 influential features
+suppressWarnings({
+  for (feature in top_10_features) {
+    # Get the SHAP values for this feature
+    shap_values_feature <- combined_shap_values[, feature]
+    # Get the feature values
+    feature_values <- combined_test_data[[feature]]
+    
+    # Create plot data frame
+    plot_data <- data.frame(SHAP = shap_values_feature, 
+                            Value = feature_values)
+    
+    # Create the plot
+    p <- ggplot(data = plot_data, aes(x = Value, y = SHAP)) +
+      geom_point(alpha = 0.3, size = 0.5, position = position_jitter(width = 0.2)) +
+      geom_smooth(method = "loess", se = TRUE) +
+      labs(title = paste("SHAP Dependence Plot for", feature),
+           x = feature,
+           y = "SHAP value") +
+      theme_minimal()
+    
+    print(p)
+  }
+})
+
+dev.off()
+
+# Display in viewer
+for (feature in top_10_features) {
+  shap_values_feature <- combined_shap_values[, feature]
+  feature_values <- combined_test_data[[feature]]
+  
+  plot_data <- data.frame(SHAP = shap_values_feature, 
+                          Value = feature_values)
+  
+  p <- ggplot(data = plot_data, aes(x = Value, y = SHAP)) +
+    geom_point(alpha = 0.3, size = 0.5, position = position_jitter(width = 0.2)) +
+    geom_smooth(method = "loess", se = TRUE) +
+    labs(title = paste("SHAP Dependence Plot for", feature),
+         x = feature,
+         y = "SHAP value") +
+    theme_minimal()
+  
+  print(p)
+}
+
