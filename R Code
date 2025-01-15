@@ -340,7 +340,7 @@ calculate_fairness_metrics <- function(data, predictions, variable, unprivileged
 # Calculate fairness metrics
 fairness_sex <- calculate_fairness_metrics(combined_test_data, combined_predictions, "SEX", "1", "2")
 fairness_ethnicity <- calculate_fairness_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "3", "2")
-fairness_race <- calculate_fairness_metrics(combined_test_data, combined_predictions, "race_new", "2", "3")
+fairness_race <- calculate_fairness_metrics(combined_test_data, combined_predictions, "race_new", "3", "2")
 
 # Combine fairness metrics
 fairness_df <- data.frame(
