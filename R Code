@@ -818,3 +818,265 @@ for (feature in top_10_features) {
   print(p)
 }
 
+################################################################################
+# Create list to store metrics for each fold
+fold_metrics_list <- list()
+
+# Calculate metrics for each fold
+for(i in 1:5) {
+  fold_metrics_list[[i]] <- calculate_metrics(
+    all_actual[[i]], 
+    all_predictions[[i]], 
+    test_threshold
+  )
+}
+
+# Convert list of metrics to data frame where each row is a fold
+fold_metrics_df <- do.call(rbind, fold_metrics_list)
+fold_metrics_df <- as.data.frame(fold_metrics_df)
+fold_metrics_df$Fold <- 1:5
+
+# Calculate summary statistics
+summary_metrics <- data.frame(
+  Metric = colnames(fold_metrics_df)[!colnames(fold_metrics_df) %in% "Fold"],
+  Mean = colMeans(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"]),
+  SD = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, sd),
+  Min = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, min),
+  Max = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, max)
+)
+
+# Create a long format of fold metrics for easier viewing/analysis
+fold_metrics_long <- tidyr::pivot_longer(
+  fold_metrics_df,
+  cols = -Fold,
+  names_to = "Metric",
+  values_to = "Value"
+)
+
+# Round all numeric values to 3 decimal places
+summary_metrics[, c("Mean", "SD", "Min", "Max")] <- round(summary_metrics[, c("Mean", "SD", "Min", "Max")], 3)
+fold_metrics_long$Value <- round(fold_metrics_long$Value, 3)
+
+# Create formatted summary with mean ± SD
+summary_metrics$Formatted <- sprintf("%.3f ± %.3f", summary_metrics$Mean, summary_metrics$SD)
+summary_metrics$Range <- sprintf("%.3f-%.3f", summary_metrics$Min, summary_metrics$Max)
+
+# Print results
+print("Individual Fold Metrics:")
+print(fold_metrics_long)
+
+print("\nSummary Statistics:")
+print(summary_metrics)
+
+# Write results to CSV files
+write.csv(fold_metrics_long, "fold_metrics.csv", row.names = FALSE)
+write.csv(summary_metrics, "summary_metrics.csv", row.names = FALSE)
+
+# Repeat for demographic subgroups
+calculate_subgroup_fold_metrics <- function(data, predictions, variable, value) {
+  fold_metrics_list <- list()
+  
+  for(i in 1:5) {
+    subgroup_indices <- which(all_test_data[[i]][[variable]] == value)
+    subgroup_actual <- all_actual[[i]][subgroup_indices]
+    subgroup_predictions <- all_predictions[[i]][subgroup_indices]
+    
+    fold_metrics_list[[i]] <- calculate_metrics(
+      subgroup_actual,
+      subgroup_predictions,
+      test_threshold
+    )
+  }
+  
+  # Convert to data frame
+  fold_metrics_df <- do.call(rbind, fold_metrics_list)
+  fold_metrics_df <- as.data.frame(fold_metrics_df)
+  fold_metrics_df$Fold <- 1:5
+  
+  # Calculate summary
+  summary_metrics <- data.frame(
+    Metric = colnames(fold_metrics_df)[!colnames(fold_metrics_df) %in% "Fold"],
+    Mean = colMeans(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"]),
+    SD = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, sd),
+    Min = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, min),
+    Max = apply(fold_metrics_df[, !colnames(fold_metrics_df) %in% "Fold"], 2, max)
+  )
+  
+  summary_metrics[, c("Mean", "SD", "Min", "Max")] <- round(summary_metrics[, c("Mean", "SD", "Min", "Max")], 3)
+  summary_metrics$Formatted <- sprintf("%.3f ± %.3f", summary_metrics$Mean, summary_metrics$SD)
+  summary_metrics$Range <- sprintf("%.3f-%.3f", summary_metrics$Min, summary_metrics$Max)
+  
+  return(list(
+    fold_metrics = fold_metrics_df,
+    summary = summary_metrics
+  ))
+}
+
+# Calculate metrics for each demographic group
+demographic_metrics <- list(
+  female = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "SEX", "1"),
+  male = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "SEX", "2"),
+  hispanic = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "3"),
+  non_hispanic = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "2"),
+  white = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "race_new", "2"),
+  non_white = calculate_subgroup_fold_metrics(combined_test_data, combined_predictions, "race_new", "3")
+)
+
+# Combine all demographic summaries into one data frame
+demographic_summary <- do.call(rbind, lapply(names(demographic_metrics), function(group) {
+  summary_df <- demographic_metrics[[group]]$summary
+  summary_df$Group <- group
+  return(summary_df)
+}))
+
+# Write demographic results
+write.csv(demographic_summary, "demographic_metrics_summary.csv", row.names = FALSE)
+
+# Create a comprehensive table comparing all groups
+comprehensive_table <- tidyr::pivot_wider(
+  demographic_summary[, c("Group", "Metric", "Formatted")],
+  names_from = Group,
+  values_from = Formatted
+)
+
+# Add overall metrics
+overall_formatted <- summary_metrics[, c("Metric", "Formatted")]
+comprehensive_table <- merge(
+  data.frame(Metric = overall_formatted$Metric, Overall = overall_formatted$Formatted),
+  comprehensive_table,
+  by = "Metric"
+)
+
+write.csv(comprehensive_table, "comprehensive_metrics_table.csv", row.names = FALSE)
+
+# Function to calculate rates for each fold
+calculate_rates <- function(actual, predicted, threshold) {
+  outcome_rate <- mean(actual)
+  selection_rate <- mean(predicted > threshold)
+  
+  return(c(
+    outcome_rate = outcome_rate,
+    selection_rate = selection_rate
+  ))
+}
+
+# Calculate overall rates for each fold
+overall_rates_list <- list()
+for(i in 1:5) {
+  overall_rates_list[[i]] <- calculate_rates(
+    all_actual[[i]],
+    all_predictions[[i]],
+    test_threshold
+  )
+}
+
+# Convert to data frame
+overall_rates_df <- do.call(rbind, overall_rates_list)
+overall_rates_df <- as.data.frame(overall_rates_df)
+overall_rates_df$Fold <- 1:5
+
+# Calculate summary statistics for overall rates
+overall_rates_summary <- data.frame(
+  Rate = c("Outcome Rate", "Selection Rate"),
+  Mean = colMeans(overall_rates_df[, c("outcome_rate", "selection_rate")]),
+  SD = apply(overall_rates_df[, c("outcome_rate", "selection_rate")], 2, sd),
+  Min = apply(overall_rates_df[, c("outcome_rate", "selection_rate")], 2, min),
+  Max = apply(overall_rates_df[, c("outcome_rate", "selection_rate")], 2, max)
+)
+
+# Round and format
+overall_rates_summary[, c("Mean", "SD", "Min", "Max")] <- 
+  round(overall_rates_summary[, c("Mean", "SD", "Min", "Max")], 3)
+overall_rates_summary$Formatted <- sprintf("%.3f ± %.3f", 
+                                           overall_rates_summary$Mean, 
+                                           overall_rates_summary$SD)
+overall_rates_summary$Range <- sprintf("%.3f-%.3f", 
+                                       overall_rates_summary$Min, 
+                                       overall_rates_summary$Max)
+
+# Function to calculate subgroup rates
+calculate_subgroup_rates <- function(data, predictions, variable, value) {
+  fold_rates_list <- list()
+  
+  for(i in 1:5) {
+    subgroup_indices <- which(all_test_data[[i]][[variable]] == value)
+    subgroup_actual <- all_actual[[i]][subgroup_indices]
+    subgroup_predictions <- all_predictions[[i]][subgroup_indices]
+    
+    fold_rates_list[[i]] <- calculate_rates(
+      subgroup_actual,
+      subgroup_predictions,
+      test_threshold
+    )
+  }
+  
+  # Convert to data frame
+  fold_rates_df <- do.call(rbind, fold_rates_list)
+  fold_rates_df <- as.data.frame(fold_rates_df)
+  fold_rates_df$Fold <- 1:5
+  
+  # Calculate summary
+  summary_rates <- data.frame(
+    Rate = c("Outcome Rate", "Selection Rate"),
+    Mean = colMeans(fold_rates_df[, c("outcome_rate", "selection_rate")]),
+    SD = apply(fold_rates_df[, c("outcome_rate", "selection_rate")], 2, sd),
+    Min = apply(fold_rates_df[, c("outcome_rate", "selection_rate")], 2, min),
+    Max = apply(fold_rates_df[, c("outcome_rate", "selection_rate")], 2, max)
+  )
+  
+  # Round and format
+  summary_rates[, c("Mean", "SD", "Min", "Max")] <- 
+    round(summary_rates[, c("Mean", "SD", "Min", "Max")], 3)
+  summary_rates$Formatted <- sprintf("%.3f ± %.3f", 
+                                     summary_rates$Mean, 
+                                     summary_rates$SD)
+  summary_rates$Range <- sprintf("%.3f-%.3f", 
+                                 summary_rates$Min, 
+                                 summary_rates$Max)
+  
+  return(list(
+    fold_rates = fold_rates_df,
+    summary = summary_rates
+  ))
+}
+
+# Calculate rates for each demographic group
+demographic_rates <- list(
+  female = calculate_subgroup_rates(combined_test_data, combined_predictions, "SEX", "1"),
+  male = calculate_subgroup_rates(combined_test_data, combined_predictions, "SEX", "2"),
+  hispanic = calculate_subgroup_rates(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "3"),
+  non_hispanic = calculate_subgroup_rates(combined_test_data, combined_predictions, "ETHNICITY_HISPANIC", "2"),
+  white = calculate_subgroup_rates(combined_test_data, combined_predictions, "race_new", "2"),
+  non_white = calculate_subgroup_rates(combined_test_data, combined_predictions, "race_new", "3")
+)
+
+# Combine all demographic summaries into one data frame
+demographic_rates_summary <- do.call(rbind, lapply(names(demographic_rates), function(group) {
+  summary_df <- demographic_rates[[group]]$summary
+  summary_df$Group <- group
+  return(summary_df)
+}))
+
+# Create comprehensive table comparing all groups
+comprehensive_rates_table <- tidyr::pivot_wider(
+  demographic_rates_summary[, c("Group", "Rate", "Formatted")],
+  names_from = Group,
+  values_from = Formatted
+)
+
+# Add overall rates
+comprehensive_rates_table <- merge(
+  data.frame(Rate = overall_rates_summary$Rate, 
+             Overall = overall_rates_summary$Formatted),
+  comprehensive_rates_table,
+  by = "Rate"
+)
+
+# Write results to CSV files
+write.csv(overall_rates_summary, "overall_rates_summary.csv", row.names = FALSE)
+write.csv(demographic_rates_summary, "demographic_rates_summary.csv", row.names = FALSE)
+write.csv(comprehensive_rates_table, "comprehensive_rates_table.csv", row.names = FALSE)
+
+# Print summary table
+print("Comprehensive Rates Table:")
+print(comprehensive_rates_table)
